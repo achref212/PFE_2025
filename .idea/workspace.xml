@@ -5,15 +5,11 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="630dec54-da86-49e3-aecb-50b3e544ef0c" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/.idea/PFE_2025.iml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/Project_Default.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/app/main.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/test_main.http" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/api/auth/routes.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/api/auth/routes.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/api/auth/schemas.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/api/auth/schemas.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/core/email.py" beforeDir="false" afterPath="$PROJECT_DIR$/app/core/email.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/app/templates/registration_verification.html" beforeDir="false" afterPath="$PROJECT_DIR$/app/templates/registration_verification.html" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -107,7 +103,7 @@
       <option name="presentableId" value="Default" />
       <updated>1747832111375</updated>
       <workItem from="1747832126003" duration="12245000" />
-      <workItem from="1747902680985" duration="3940000" />
+      <workItem from="1747902680985" duration="14880000" />
     </task>
     <servers />
   </component>

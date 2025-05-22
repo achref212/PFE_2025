@@ -27,8 +27,9 @@ class UserResponse(BaseModel):
 class TokenResponse(BaseModel):
     user: UserResponse
     access_token: str
+    refresh_token: str
     token_type: str
-    
+
 class UserUpdate(BaseModel):
     nom: Optional[str] = None
     prenom: Optional[str] = None
@@ -49,20 +50,19 @@ class UserUpdate(BaseModel):
     adresse: Optional[str] = None
     academie: Optional[str] = None
     est_boursier: Optional[bool] = None
+
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 
 class VerifyCodeRequest(BaseModel):
     email: EmailStr
-    token: str
+    code: str
 
 class ResetPasswordRequest(BaseModel):
     email: EmailStr
-    token: str
+    code: str
     new_password: str
-
 
 class VerifyRegistrationRequest(BaseModel):
     email: EmailStr
-    token: str
     code: str
