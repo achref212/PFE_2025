@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Registration Verification Code</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+        }
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+            border: 1px solid #ccc;
+            border-radius: 10px;
+            background-color: #f9f9f9;
+        }
+        .logo {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+        .logo img {
+            max-width: 100px;
+        }
+        .verification-code {
+            background-color: #FFA500;
+            color: #fff;
+            padding: 10px;
+            border-radius: 5px;
+            text-align: center;
+            font-size: 18px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">
+            <img src="https://i.ibb.co/xS6brZj/418571875-7129425773809635-2966851991592473008-n.png" alt="logo" border="0">
+        </div>
+        <p>Dear {{ email }},</p>
+        <p>Thank you for registering with us! Your verification code is:</p>
+        <div class="verification-code">{{ verification_code }}</div>
+        <p>Please use this code to complete your registration. This code expires in 30 minutes.</p>
+    </div>
+</body>
+</html>
