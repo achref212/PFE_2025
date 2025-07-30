@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     EMAIL_DEFAULT_SENDER: str
     RESET_CODE_EXPIRES: int = 1800  # 30 minutes
     REGISTRATION_CODE_EXPIRES: int = 1800  # 30 minutes
+    GOOGLE_CLIENT_ID: str
+    GOOGLE_CLIENT_SECRET: str
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

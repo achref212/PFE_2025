@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, requests
 from fastapi_jwt_auth import AuthJWT
 from fastapi.security import HTTPBearer
 from sqlalchemy.orm import Session
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from app.core.database import SessionLocal
 from app.models.user import User
 from app.api.auth.schemas import (
@@ -10,6 +10,8 @@ from app.api.auth.schemas import (
     ForgotPasswordRequest, VerifyCodeRequest, ResetPasswordRequest,
     VerifyRegistrationRequest
 )
+from pydantic import BaseModel
+
 from app.core.email import send_registration_code_email, send_reset_code_email, EmailNotExistError
 from app.core.config import settings
 from passlib.context import CryptContext
@@ -18,6 +20,8 @@ import string
 from typing import Dict
 import re
 import logging
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -27,7 +31,8 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # In-memory storage for pending registrations (email -> {code, user_data, expires_at})
 pending_registrations: Dict[str, dict] = {}
 CODE_EXPIRATION_MINUTES = 30  # Codes expire after 30 minutes
-
+class GoogleTokenRequest(BaseModel):
+    token: str
 def get_db():
     db = SessionLocal()
     try:
@@ -201,20 +206,30 @@ def update_profile(
 ):
     Authorize.jwt_required()
     email = Authorize.get_jwt_subject()
+
     user = db.query(User).filter(User.email == email).first()
     if not user:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
 
     update_data = user_update.dict(exclude_unset=True)
+    print("⏺️ Champs demandés :", update_data)
+
+    # 🔁 Ne mettre à jour que les champs modifiés
     for key, value in update_data.items():
-        setattr(user, key, value)
+        if hasattr(user, key):
+            current_value = getattr(user, key)
+            if current_value != value:
+                print(f"✏️ Champ modifié : {key} — Ancienne valeur : {current_value} → Nouvelle valeur : {value}")
+                setattr(user, key, value)
 
     try:
         db.commit()
         db.refresh(user)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Erreur de base de données: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour du profil : {str(e)}")
 
     return user
 
@@ -270,3 +285,84 @@ def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db))
         raise HTTPException(status_code=500, detail=f"Erreur de base de données: {str(e)}")
 
     return {"message": "Mot de passe réinitialisé avec succès"}
+
+@router.post("/auth/google", response_model=TokenResponse)
+def google_login(
+    token_data: GoogleTokenRequest,
+    db: Session = Depends(get_db),
+    Authorize: AuthJWT = Depends()
+):
+    try:
+        token = token_data.token
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request())
+
+        email = idinfo.get("email")
+        name = idinfo.get("name", "")
+        picture = idinfo.get("picture", "")
+        given_name = idinfo.get("given_name", "")
+        family_name = idinfo.get("family_name", "")
+
+        if not email:
+            raise HTTPException(status_code=400, detail="Email non trouvé dans le token Google")
+
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Token Google invalide : {e}")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(
+            email=email,
+            nom=family_name or "Nom",
+            prenom=given_name or "Prénom",
+            sexe="H",
+            date_naissance=date(2000, 1, 1),
+            password_hash=pwd_context.hash("google_login"),
+            profile_picture=picture,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    access_token = Authorize.create_access_token(subject=email, user_claims={"email": email})
+    refresh_token = Authorize.create_refresh_token(subject=email, user_claims={"email": email})
+
+    return {
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "nom": user.nom,
+            "prenom": user.prenom,
+            "profile_picture": user.profile_picture,
+            "objectif": user.objectif,  # <—— ajouter ça
+            "niveau_scolaire": user.niveau_scolaire  # <—— facultatif
+        },
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+@router.patch("/auth/me", response_model=UserResponse, dependencies=[Depends(security)])
+def update_user_profile(
+    updates: UserUpdate,
+    Authorize: AuthJWT = Depends(),
+    db: Session = Depends(get_db)
+):
+    Authorize.jwt_required()
+    email = Authorize.get_jwt_subject()
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+
+    update_fields = updates.dict(exclude_unset=True)
+
+    for field, value in update_fields.items():
+        setattr(user, field, value)
+
+    try:
+        db.commit()
+        db.refresh(user)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour : {e}")
+
+    return user
