@@ -9,6 +9,7 @@ from passlib.context import CryptContext
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+
 class User(Base):
     __tablename__ = "user"
     __table_args__ = {"comment": "Comptes et profil des étudiants"}
@@ -24,22 +25,23 @@ class User(Base):
     objectif = Column(String(255), nullable=True)
     niveau_scolaire = Column(String(250), nullable=True)
     voie = Column(String(250), nullable=True)
-    specialites = Column(String(300), nullable=True)  # Si plusieurs, séparées par virgule
+    specialites = Column(String(300), nullable=True)
     filiere = Column(String(255), nullable=True)
     telephone = Column(String(20), nullable=True)
     budget = Column(String(255), nullable=True)
     est_boursier = Column(Boolean, default=False)
     plan_action_id = Column(Integer, ForeignKey("plan_actions.id"), nullable=True)
-    plan_action = relationship("PlanAction", backref="users")
-    moyenne_id = Column(Integer, ForeignKey("moyenne.id"), nullable=True, unique=True)
-    location_id = Column(Integer, ForeignKey("location.id"), nullable=True, unique=True)
-    step_answers = relationship("UserStepAnswer", back_populates="user", cascade="all, delete-orphan")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    # Relations
-    plan_action = relationship("PlanAction", backref="users")
+    # Removed location_id and moyenne_id
+
+    # Relationships
+    plan_action = relationship("PlanAction", back_populates="users")
+    location = relationship("Location", back_populates="user", uselist=False)
+    moyenne = relationship("Moyenne", back_populates="user", uselist=False)
     step_answers = relationship("UserStepAnswer", back_populates="user", cascade="all, delete-orphan")
     plan_responses = relationship("UserPlanResponse", back_populates="user", cascade="all, delete-orphan")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
     def set_password(self, password: str) -> None:
         if len(password) < 8:
             raise ValueError("Le mot de passe doit contenir au moins 8 caractères.")

@@ -319,17 +319,32 @@ def google_login(
         picture = idinfo.get("picture", "")
         given_name = idinfo.get("given_name", "")
         family_name = idinfo.get("family_name", "")
+        # Retrieve gender from Google token
+        gender = idinfo.get("gender", None)
     except ValueError as e:
         logger.error(f"Invalid Google token: {str(e)}")
         raise HTTPException(status_code=401, detail=f"Token Google invalide: {str(e)}")
 
     user = db.query(User).filter(User.email == email).first()
     if not user:
+        # Map Google gender to your sexe field
+        sexe = "M"  # Default value
+        if gender:
+            if gender.lower() == "male":
+                sexe = "M"
+            elif gender.lower() == "female":
+                sexe = "F"
+            elif gender.lower() == "other":
+                sexe = "O"  # Or another value that fits your schema
+            else:
+                logger.warning(f"Unknown gender value from Google: {gender}")
+                sexe = "M"  # Fallback to default if gender is unrecognized
+
         user = User(
             email=email,
             nom=family_name or "Nom",
             prenom=given_name or "Prénom",
-            sexe="Other",
+            sexe=sexe,
             date_naissance=date(2000, 1, 1),
             password_hash=pwd_context.hash("google_login_" + email),
             profile_picture=picture

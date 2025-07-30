@@ -2,6 +2,7 @@ from sqlalchemy import Column, Integer, String, Float, ForeignKey
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
+
 class Location(Base):
     __tablename__ = "location"
 
@@ -12,5 +13,7 @@ class Location(Base):
     longitude = Column(Float, nullable=False)
     etablissement = Column(String(255), nullable=False)
     academie = Column(String(255), nullable=False)
-    user_id = Column(Integer, ForeignKey("user.id"), unique=True, index=True)
-    user = relationship("User", backref="location")
+    user_id = Column(Integer, ForeignKey("user.id"), unique=True, index=True, nullable=False)  # Ensure non-nullable
+
+    # Relationship
+    user = relationship("User", back_populates="location")
