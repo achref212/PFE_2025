@@ -1,13 +1,16 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi_jwt_auth import AuthJWT
 from fastapi.security import HTTPBearer
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload,lazyload
 from datetime import datetime, timedelta, date
 from app.core.database import SessionLocal
 from app.models.Location import Location
 from app.models.Moyenne import Moyenne
 from app.models.PlanAction import PlanAction, PlanStep, PlanQuestion, UserPlanResponse, UserStepAnswer
 from app.models.user import User
+from app.models.Formation import Formation, Lieu, SalaireBornes, Badge, FiliereBac, SpecialiteFavorisee, MatiereEnseignee, DeboucheMetier, DeboucheSecteur, TsTauxParBac, IntervalsAdmis, CriteresCandidature, SousCritere, Boursiers, ProfilsAdmis, PromoCharacteristics, PostFormationOutcomes, VoieGenerale, VoiePro, VoieTechnologique
+from app.api.formation.schemas import FormationSchema
+
 from app.api.auth.schemas import (
     UserCreate, UserResponse, LoginRequest, TokenResponse, UserUpdate,
     ForgotPasswordRequest, VerifyCodeRequest, ResetPasswordRequest,
@@ -23,7 +26,7 @@ from app.core.config import settings
 from passlib.context import CryptContext
 import random
 import string
-from typing import Dict
+from typing import Dict, List
 import re
 import logging
 from google.oauth2 import id_token
@@ -309,7 +312,7 @@ def google_login(
     db: Session = Depends(get_db),
     Authorize: AuthJWT = Depends()
 ):
-    """Authenticate user with Google OAuth."""
+    """Authenticate user with Google OAuth and collect additional profile data."""
     try:
         idinfo = id_token.verify_oauth2_token(token_data.token, google_requests.Request())
         email = idinfo.get("email")
@@ -321,13 +324,15 @@ def google_login(
         family_name = idinfo.get("family_name", "")
         # Retrieve gender from Google token
         gender = idinfo.get("gender", None)
+        # Attempt to retrieve birth date (not typically in id_token, requires People API)
+        birthdate = idinfo.get("birthdate", None)  # May not be present
     except ValueError as e:
         logger.error(f"Invalid Google token: {str(e)}")
         raise HTTPException(status_code=401, detail=f"Token Google invalide: {str(e)}")
 
     user = db.query(User).filter(User.email == email).first()
     if not user:
-        # Map Google gender to your sexe field
+        # Map Google gender to sexe field
         sexe = "M"  # Default value
         if gender:
             if gender.lower() == "male":
@@ -335,37 +340,77 @@ def google_login(
             elif gender.lower() == "female":
                 sexe = "F"
             elif gender.lower() == "other":
-                sexe = "O"  # Or another value that fits your schema
+                sexe = "O"
             else:
                 logger.warning(f"Unknown gender value from Google: {gender}")
-                sexe = "M"  # Fallback to default if gender is unrecognized
+                sexe = "M"
 
+        # Parse birthdate if available (expected format: YYYY-MM-DD or similar)
+        date_naissance = date(2000, 1, 1)  # Default value
+        if birthdate:
+            try:
+                from datetime import datetime
+                date_naissance = datetime.strptime(birthdate, "%Y-%m-%d").date()
+            except ValueError:
+                logger.warning(f"Invalid birthdate format from Google: {birthdate}")
+                date_naissance = date(2000, 1, 1)
+
+        # Create new user with default values for nullable fields
         user = User(
             email=email,
             nom=family_name or "Nom",
             prenom=given_name or "Prénom",
             sexe=sexe,
-            date_naissance=date(2000, 1, 1),
+            date_naissance=date_naissance,
             password_hash=pwd_context.hash("google_login_" + email),
-            profile_picture=picture
+            profile_picture=picture,
+            objectif=None,  # Nullable, can be set later
+            niveau_scolaire=None,  # Nullable
+            voie=None,  # Nullable
+            specialites=None,  # Nullable
+            filiere=None,  # Nullable
+            telephone=None,  # Nullable
+            budget=None,  # Nullable
+            est_boursier=False  # Default value
         )
         try:
             db.add(user)
             db.commit()
             db.refresh(user)
+
+            # Create a Location record if location data is available
+            # Note: Google id_token typically doesn't provide location data
+            # This is a placeholder; you may need to collect this from the user later
+            location = Location(
+                user_id=user.id,
+                adresse="Adresse non spécifiée",  # Placeholder
+                distance=None,  # Nullable
+                latitude=0.0,  # Placeholder (non-nullable)
+                longitude=0.0,  # Placeholder (non-nullable)
+                etablissement="Établissement non spécifié",  # Placeholder
+                academie="Académie non spécifiée"  # Placeholder
+            )
+            db.add(location)
+            db.commit()
+            db.refresh(location)
         except Exception as e:
             db.rollback()
-            logger.error(f"Database error during Google user creation: {str(e)}")
+            logger.error(f"Database error during Google user/location creation: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Erreur de base de données: {str(e)}")
 
     access_token = Authorize.create_access_token(subject=user.email, user_claims={"email": user.email})
     refresh_token = Authorize.create_refresh_token(subject=user.email, user_claims={"email": user.email})
 
+    # Check if location exists for the user
+    location = db.query(Location).filter(Location.user_id == user.id).first()
+    profile_complete = bool(location and user.date_naissance != date(2000, 1, 1))
+
     return {
         "user": user,
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "token_type": "bearer"
+        "token_type": "bearer",
+        "profile_complete": profile_complete  # Indicate if profile needs completion
     }
 
 @router.post("/me/location", response_model=UserResponse)
@@ -450,7 +495,7 @@ def update_user_location(
 
     return location
 
-@router.post("/me/moyenne", response_model=UserResponse)
+@router.post("/me/moyenne", response_model=MoyenneResponse)
 def update_moyenne(
     moyenne_data: MoyenneCreate,
     db: Session = Depends(get_db),
@@ -468,17 +513,12 @@ def update_moyenne(
             moyenne = db.query(Moyenne).filter(Moyenne.id == user.moyenne_id).first()
             if not moyenne:
                 raise HTTPException(status_code=404, detail="Moyenne introuvable")
-            for key, value in moyenne_data.dict().items():
-                setattr(moyenne, f"moyenne_{key}" if key != "generale" else "moyenne_generale", value)
+            moyenne.specialty = moyenne_data.specialty
+            moyenne.notes = moyenne_data.notes
         else:
             moyenne = Moyenne(
-                moyenne_generale=moyenne_data.generale,
-                moyenne_francais=moyenne_data.francais,
-                moyenne_philo=moyenne_data.philo,
-                moyenne_math=moyenne_data.math,
-                moyenne_svt=moyenne_data.svt,
-                moyenne_physique=moyenne_data.physique,
-                moyenne_anglais=moyenne_data.anglais,
+                specialty=moyenne_data.specialty,
+                notes=moyenne_data.notes,
                 user_id=user.id
             )
             db.add(moyenne)
@@ -486,13 +526,13 @@ def update_moyenne(
             user.moyenne_id = moyenne.id
 
         db.commit()
-        db.refresh(user)
+        db.refresh(moyenne)
     except Exception as e:
         db.rollback()
         logger.error(f"Database error during moyenne update: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour des moyennes: {str(e)}")
 
-    return user
+    return moyenne
 
 @router.get("/me/moyenne", response_model=MoyenneResponse)
 def get_user_moyenne(
@@ -530,8 +570,8 @@ def update_user_moyenne(
         raise HTTPException(status_code=404, detail="Moyenne introuvable")
 
     try:
-        for key, value in moyenne_data.dict().items():
-            setattr(moyenne, f"moyenne_{key}" if key != "generale" else "moyenne_generale", value)
+        moyenne.specialty = moyenne_data.specialty
+        moyenne.notes = moyenne_data.notes
         db.commit()
         db.refresh(moyenne)
     except Exception as e:
@@ -540,7 +580,6 @@ def update_user_moyenne(
         raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour des moyennes: {str(e)}")
 
     return moyenne
-
 @router.post("/plan-action", response_model=PlanActionResponse)
 def create_plan_action(
     plan_data: PlanActionCreate,
@@ -749,3 +788,46 @@ def get_user_plan_action(
         raise HTTPException(status_code=404, detail="Plan d’action non trouvé")
 
     return plan
+
+# Get a specific formation with all details
+@router.get("/formations/{formation_id}", response_model=FormationSchema)
+def get_formation(formation_id: int, db: Session = Depends(get_db)):
+    # Use lazyload('*') to defer all relationship loading
+    formation = db.query(Formation).options(
+        lazyload('*')  # Defer loading of all relationships
+    ).filter(Formation.id == formation_id).first()
+
+    if not formation:
+        raise HTTPException(status_code=404, detail="Formation not found")
+
+    # Force loading of relationships to ensure all data is available for serialization
+    formation.lieu  # Accessing triggers lazy load
+    formation.salaire_bornes
+    formation.badges  # Accessing collections triggers lazy load
+    formation.filieres_bac
+    formation.specialites_favorisees
+    formation.matieres_enseignees
+    formation.debouches_metiers
+    formation.debouches_secteurs
+    formation.ts_taux_par_bac
+    formation.intervalles_admis
+    formation.profils_admis
+    formation.criteres_candidature  # Includes sous_criteres due to relationship
+    formation.boursiers
+    formation.promo_characteristics
+    formation.post_formation_outcomes
+    formation.voie_generale
+    formation.voie_pro
+    formation.voie_technologique
+
+    return formation
+
+# Get 10 formations
+@router.get("/formations/", response_model=List[FormationSchema])
+def get_formations(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    limit = min(limit, 10)  # Cap limit to prevent overload
+    formations = db.query(Formation).options(
+        joinedload(Formation.lieu),  # Load only critical data eagerly
+        lazyload('*')  # Defer loading of other relationships
+    ).offset(skip).limit(limit).all()
+    return formations

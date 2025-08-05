@@ -1,6 +1,6 @@
 from datetime import date
 from sqlalchemy import (
-    Column, Integer, String, Date, Boolean, DateTime, func, ForeignKey
+    Column, Integer, String, Date, Boolean, DateTime, func, ForeignKey, JSON
 )
 from sqlalchemy.orm import relationship
 
@@ -25,7 +25,7 @@ class User(Base):
     objectif = Column(String(255), nullable=True)
     niveau_scolaire = Column(String(250), nullable=True)
     voie = Column(String(250), nullable=True)
-    specialites = Column(String(300), nullable=True)
+    specialites = Column(JSON, nullable=True)
     filiere = Column(String(255), nullable=True)
     telephone = Column(String(20), nullable=True)
     budget = Column(String(255), nullable=True)

@@ -1,6 +1,7 @@
 from pydantic import BaseModel, EmailStr, Field
 from datetime import date, datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
+
 
 # 🔐 Utilisé pour l'inscription
 class UserCreate(BaseModel):
@@ -39,27 +40,16 @@ class LocationResponse(BaseModel):
 
 # 📊 Moyenne models
 class MoyenneCreate(BaseModel):
-    generale: float
-    francais: Optional[float] = None
-    philo: Optional[float] = None
-    math: Optional[float] = None
-    svt: Optional[float] = None
-    physique: Optional[float] = None
-    anglais: Optional[float] = None
+    specialty: Optional[List[str]] = None  # List of specialties, e.g., ["Math", "Physics"]
+    notes: Optional[List[Dict[str, float]]] = None  # List of notes, e.g., [{"subject": "Math", "score": 15.5}, ...]
 
 class MoyenneResponse(BaseModel):
     id: int
-    moyenne_generale: float
-    moyenne_francais: Optional[float] = None
-    moyenne_philo: Optional[float] = None
-    moyenne_math: Optional[float] = None
-    moyenne_svt: Optional[float] = None
-    moyenne_physique: Optional[float] = None
-    moyenne_anglais: Optional[float] = None
+    specialty: Optional[List[str]] = None  # List of specialties
+    notes: Optional[List[Dict[str, float]]] = None  # List of notes with subject and score
 
     class Config:
         orm_mode = True
-
 # 📋 PlanAction models
 class PlanActionCreate(BaseModel):
     nom: str
@@ -138,7 +128,7 @@ class UserResponse(BaseModel):
     niveau_scolaire: Optional[str] = None
     objectif: Optional[str] = None
     voie: Optional[str] = None
-    specialites: Optional[str] = None
+    specialites: Optional[List[str]] = None
     filiere: Optional[str] = None
     telephone: Optional[str] = None
     budget: Optional[str] = None
@@ -171,7 +161,7 @@ class UserUpdate(BaseModel):
     niveau_scolaire: Optional[str] = None
     objectif: Optional[str] = None
     voie: Optional[str] = None
-    specialites: Optional[str] = None
+    specialites: Optional[List[str]] = None
     filiere: Optional[str] = None
     telephone: Optional[str] = None
     budget: Optional[str] = None
