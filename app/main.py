@@ -1,9 +1,11 @@
+import app
 from fastapi import FastAPI
 from fastapi_jwt_auth import AuthJWT
 from app.core.database import init_db
 from app.api.auth.routes import router as auth_router
 from app.core.config import settings
 from fastapi.security import HTTPBearer
+from fastapi.openapi.utils import get_openapi
 
 app = FastAPI(
     title="Student Management API",

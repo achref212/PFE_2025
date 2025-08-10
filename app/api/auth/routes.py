@@ -1,34 +1,47 @@
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi_jwt_auth import AuthJWT
 from fastapi.security import HTTPBearer
-from sqlalchemy.orm import Session, joinedload,lazyload
+from sqlalchemy.orm import Session, lazyload, selectinload
+from sqlalchemy import func, asc
 from datetime import datetime, timedelta, date
-from app.core.database import SessionLocal
-from app.models.Location import Location
-from app.models.Moyenne import Moyenne
-from app.models.PlanAction import PlanAction, PlanStep, PlanQuestion, UserPlanResponse, UserStepAnswer
-from app.models.user import User
-from app.models.Formation import Formation, Lieu, SalaireBornes, Badge, FiliereBac, SpecialiteFavorisee, MatiereEnseignee, DeboucheMetier, DeboucheSecteur, TsTauxParBac, IntervalsAdmis, CriteresCandidature, SousCritere, Boursiers, ProfilsAdmis, PromoCharacteristics, PostFormationOutcomes, VoieGenerale, VoiePro, VoieTechnologique
-from app.api.formation.schemas import FormationSchema
-
-from app.api.auth.schemas import (
-    UserCreate, UserResponse, LoginRequest, TokenResponse, UserUpdate,
-    ForgotPasswordRequest, VerifyCodeRequest, ResetPasswordRequest,
-    VerifyRegistrationRequest, LocationCreate, LocationResponse,
-    MoyenneCreate, MoyenneResponse, PlanActionCreate, PlanActionResponse,
-    PlanStepCreate, PlanStepResponse, PlanQuestionCreate, PlanQuestionResponse,
-    UserPlanResponseCreate, UserPlanResponseResponse, UserStepAnswerCreate, UserStepAnswerResponse,
-    UserPlanUpdateRequest
-)
-from pydantic import BaseModel
-from app.core.email import send_registration_code_email, send_reset_code_email, EmailNotExistError
-from app.core.config import settings
-from passlib.context import CryptContext
 import random
 import string
-from typing import Dict, List
-import re
 import logging
+from typing import Dict, List, Optional
+
+from pydantic import BaseModel
+
+from app.api.formation.schemas import AcademieSchema, LieuSchema, EtablissementSchema, FormationSchema, AcademieOut, \
+    EtablissementOut
+# --- Core / DB ---
+from app.core.database import SessionLocal
+from app.core.email import (
+    send_registration_code_email,
+    send_reset_code_email,
+    EmailNotExistError,
+)
+from passlib.context import CryptContext
+
+from app.models.Academies import Academie, Etablissement
+# --- Models ---
+from app.models.user import User
+from app.models.PlanAction import PlanAction, PlanStep, UserStepProgress
+from app.models.Formation import Formation, CriteresCandidature, Lieu  # keep your formation model
+
+# --- Schemas (your updated file we aligned earlier) ---
+from app.api.auth.schemas import (
+    # Auth / user
+    UserCreate, UserResponse, LoginRequest, TokenResponse, UserUpdate,
+    ForgotPasswordRequest, VerifyCodeRequest, ResetPasswordRequest, VerifyRegistrationRequest,
+    # Plan
+    PlanActionCreate, PlanActionResponse,
+    PlanStepCreate, PlanStepResponse,
+    UserStepProgressCreate, UserStepProgressUpdate, UserStepProgressResponse,
+)
+
+# --- Google ---
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
@@ -51,6 +64,63 @@ def get_db():
         yield db
     finally:
         db.close()
+def bootstrap_user_plan(db: Session, user: User) -> PlanAction:
+    """
+    Create a default PlanAction + 6 PlanSteps for the user and initialize UserStepProgress.
+    Safe to call multiple times: it won't create a new plan if user already has one.
+    """
+    if user.plan_action_id:
+        # User already has a plan assigned
+        plan = db.query(PlanAction).filter(PlanAction.id == user.plan_action_id).first()
+        if plan:
+            return plan
+
+    today = datetime.utcnow().date()
+    plan = PlanAction(
+        nom=f"Plan d’action de {user.prenom or user.nom or user.email}",
+        start_date=today,
+        end_date=today + timedelta(days=30),
+        is_active=True,
+    )
+    db.add(plan)
+    db.flush()  # to get plan.id
+
+    steps_spec = [
+        ("mes infos de base", "Complète tes infos personnelles de base."),
+        ("définir mes préférences", "Choisis tes domaines et types de formation préférés."),
+        ("commencer l’exploration de formations", "Parcours des formations pertinentes."),
+        ("identifier mes intérêts professionnels", "Fais des tests et clarifie tes intérêts."),
+        ("explorer mes formations (2/2)", "Approfondis les formations déjà repérées."),
+        ("commencer ma liste de formations favorites", "Ajoute tes options favorites à suivre."),
+    ]
+
+    for idx, (titre, description) in enumerate(steps_spec, start=1):
+        step_start = today + timedelta(days=7 * (idx - 1))
+        step_end = step_start + timedelta(days=14)
+        step = PlanStep(
+            plan_action_id=plan.id,
+            titre=titre,
+            description=description,
+            ordre=idx,
+            start_date=step_start,
+            end_date=step_end,
+        )
+        db.add(step)
+        db.flush()  # to get step.id
+
+        progress = UserStepProgress(
+            user_id=user.id,
+            step_id=step.id,
+            is_done=False,
+            done_at=None,
+        )
+        db.add(progress)
+
+    user.plan_action_id = plan.id
+    db.commit()
+    db.refresh(plan)
+    db.refresh(user)
+    return plan
 
 def generate_code(length=6):
     return ''.join(random.choices(string.digits, k=length))
@@ -152,6 +222,8 @@ def verify_registration(request: VerifyRegistrationRequest, db: Session = Depend
         db.add(user)
         db.commit()
         db.refresh(user)
+        # 🔥 Create plan/steps/progress
+        bootstrap_user_plan(db, user)
     except Exception as e:
         db.rollback()
         logger.error(f"Database error during registration: {str(e)}")
@@ -310,486 +382,359 @@ def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db))
 def google_login(
     token_data: GoogleTokenRequest,
     db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
+    Authorize: AuthJWT = Depends(),
 ):
-    """Authenticate user with Google OAuth and collect additional profile data."""
+    """Authenticate with Google and hydrate user with picture / gender / birthdate / address (if present)."""
     try:
         idinfo = id_token.verify_oauth2_token(token_data.token, google_requests.Request())
-        email = idinfo.get("email")
-        if not email:
-            raise HTTPException(status_code=400, detail="Email non trouvé dans le token Google")
-        name = idinfo.get("name", "")
-        picture = idinfo.get("picture", "")
-        given_name = idinfo.get("given_name", "")
-        family_name = idinfo.get("family_name", "")
-        # Retrieve gender from Google token
-        gender = idinfo.get("gender", None)
-        # Attempt to retrieve birth date (not typically in id_token, requires People API)
-        birthdate = idinfo.get("birthdate", None)  # May not be present
     except ValueError as e:
-        logger.error(f"Invalid Google token: {str(e)}")
-        raise HTTPException(status_code=401, detail=f"Token Google invalide: {str(e)}")
+        logger.error(f"Invalid Google token: {e}")
+        raise HTTPException(status_code=401, detail="Token Google invalide")
 
+    email = idinfo.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email non trouvé dans le token Google")
+    email = email.lower()
+
+    given_name = idinfo.get("given_name") or ""
+    family_name = idinfo.get("family_name") or ""
+    picture = idinfo.get("picture") or None
+    gender = idinfo.get("gender")
+    birthdate = idinfo.get("birthdate")
+
+    # OpenID 'address' claim (dict or string)
+    adresse = None
+    addr_claim = idinfo.get("address")
+    if isinstance(addr_claim, dict):
+        adresse = addr_claim.get("formatted") or " ".join(
+            filter(
+                None,
+                [
+                    addr_claim.get("street_address"),
+                    addr_claim.get("locality"),
+                    addr_claim.get("region"),
+                    addr_claim.get("postal_code"),
+                    addr_claim.get("country"),
+                ],
+            )
+        ).strip() or None
+    elif isinstance(addr_claim, str):
+        adresse = addr_claim.strip() or None
+
+    def map_gender_to_sexe(g: Optional[str]) -> str:
+        if not g:
+            return "M"
+        g = g.lower()
+        if g == "male":
+            return "M"
+        if g == "female":
+            return "F"
+        return "O"
+
+    def parse_birthdate(b: str) -> date:
+        try:
+            return datetime.strptime(b, "%Y-%m-%d").date()
+        except Exception:
+            logger.warning(f"Invalid birthdate from Google: {b}")
+            return date(2000, 1, 1)
+
+    # Upsert user
     user = db.query(User).filter(User.email == email).first()
     if not user:
-        # Map Google gender to sexe field
-        sexe = "M"  # Default value
-        if gender:
-            if gender.lower() == "male":
-                sexe = "M"
-            elif gender.lower() == "female":
-                sexe = "F"
-            elif gender.lower() == "other":
-                sexe = "O"
-            else:
-                logger.warning(f"Unknown gender value from Google: {gender}")
-                sexe = "M"
-
-        # Parse birthdate if available (expected format: YYYY-MM-DD or similar)
-        date_naissance = date(2000, 1, 1)  # Default value
-        if birthdate:
-            try:
-                from datetime import datetime
-                date_naissance = datetime.strptime(birthdate, "%Y-%m-%d").date()
-            except ValueError:
-                logger.warning(f"Invalid birthdate format from Google: {birthdate}")
-                date_naissance = date(2000, 1, 1)
-
-        # Create new user with default values for nullable fields
         user = User(
             email=email,
             nom=family_name or "Nom",
             prenom=given_name or "Prénom",
-            sexe=sexe,
-            date_naissance=date_naissance,
+            sexe=map_gender_to_sexe(gender),
+            date_naissance=parse_birthdate(birthdate) if birthdate else date(2000, 1, 1),
             password_hash=pwd_context.hash("google_login_" + email),
             profile_picture=picture,
-            objectif=None,  # Nullable, can be set later
-            niveau_scolaire=None,  # Nullable
-            voie=None,  # Nullable
-            specialites=None,  # Nullable
-            filiere=None,  # Nullable
-            telephone=None,  # Nullable
-            budget=None,  # Nullable
-            est_boursier=False  # Default value
+            # Optional user profile fields:
+            objectif=None,
+            niveau_scolaire=None,
+            voie=None,
+            specialites=None,
+            filiere=None,
+            telephone=None,
+            budget=None,
+            est_boursier=False,
+            # Address/geo fields on User (nullable)
+            adresse=adresse or None,
+            distance=None,
+            latitude=None,
+            longitude=None,
+            etablissement=None,
+            academie=None,
         )
         try:
             db.add(user)
             db.commit()
             db.refresh(user)
-
-            # Create a Location record if location data is available
-            # Note: Google id_token typically doesn't provide location data
-            # This is a placeholder; you may need to collect this from the user later
-            location = Location(
-                user_id=user.id,
-                adresse="Adresse non spécifiée",  # Placeholder
-                distance=None,  # Nullable
-                latitude=0.0,  # Placeholder (non-nullable)
-                longitude=0.0,  # Placeholder (non-nullable)
-                etablissement="Établissement non spécifié",  # Placeholder
-                academie="Académie non spécifiée"  # Placeholder
-            )
-            db.add(location)
-            db.commit()
-            db.refresh(location)
+            bootstrap_user_plan(db, user)
         except Exception as e:
             db.rollback()
-            logger.error(f"Database error during Google user/location creation: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Erreur de base de données: {str(e)}")
+            logger.error(f"DB error during Google user creation: {e}")
+            raise HTTPException(status_code=500, detail="Erreur de base de données")
+    else:
+        changed = False
+        if not user.profile_picture and picture:
+            user.profile_picture = picture
+            changed = True
+        if not user.adresse and adresse:
+            user.adresse = adresse
+            changed = True
+        if user.date_naissance == date(2000, 1, 1) and birthdate:
+            user.date_naissance = parse_birthdate(birthdate)
+            changed = True
+        if (not user.sexe or user.sexe not in {"M", "F", "O"}) and gender:
+            user.sexe = map_gender_to_sexe(gender)
+            changed = True
+        if changed:
+            try:
+                db.commit()
+                db.refresh(user)
+            except Exception as e:
+                db.rollback()
+                logger.error(f"DB error during Google user update: {e}")
+                raise HTTPException(status_code=500, detail="Erreur de base de données")
 
-    access_token = Authorize.create_access_token(subject=user.email, user_claims={"email": user.email})
-    refresh_token = Authorize.create_refresh_token(subject=user.email, user_claims={"email": user.email})
+    access_token = Authorize.create_access_token(subject=user.email)
+    refresh_token = Authorize.create_refresh_token(subject=user.email)
+    return {"user": user, "access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
 
-    # Check if location exists for the user
-    location = db.query(Location).filter(Location.user_id == user.id).first()
-    profile_complete = bool(location and user.date_naissance != date(2000, 1, 1))
+# =========================
+# Plan Actions & Steps
+# =========================
 
-    return {
-        "user": user,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "profile_complete": profile_complete  # Indicate if profile needs completion
-    }
-
-@router.post("/me/location", response_model=UserResponse)
-def update_location(
-    location_data: LocationCreate,
+@router.post("/plans", response_model=PlanActionResponse, status_code=201)
+def create_plan(
+    payload: PlanActionCreate,
     db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
+    Authorize: AuthJWT = Depends(),
 ):
-    """Create or update user's location."""
     Authorize.jwt_required()
-    email = Authorize.get_jwt_subject()
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
-
-    try:
-        if user.location_id:
-            location = db.query(Location).filter(Location.id == user.location_id).first()
-            if not location:
-                raise HTTPException(status_code=404, detail="Localisation introuvable")
-            for key, value in location_data.dict().items():
-                setattr(location, key, value)
-        else:
-            location = Location(**location_data.dict(), user_id=user.id)
-            db.add(location)
-            db.flush()
-            user.location_id = location.id
-
-        db.commit()
-        db.refresh(user)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error during location update: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour de la localisation: {str(e)}")
-
-    return user
-
-@router.get("/me/location", response_model=LocationResponse)
-def get_user_location(
-    db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
-):
-    """Get user's location."""
-    Authorize.jwt_required()
-    email = Authorize.get_jwt_subject()
-    user = db.query(User).filter(User.email == email).first()
-    if not user or not user.location_id:
-        raise HTTPException(status_code=404, detail="Localisation non trouvée")
-
-    location = db.query(Location).filter(Location.id == user.location_id).first()
-    if not location:
-        raise HTTPException(status_code=404, detail="Localisation introuvable")
-
-    return location
-
-@router.patch("/me/location", response_model=LocationResponse)
-def update_user_location(
-    location_data: LocationCreate,
-    db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
-):
-    """Update existing user's location."""
-    Authorize.jwt_required()
-    email = Authorize.get_jwt_subject()
-    user = db.query(User).filter(User.email == email).first()
-    if not user or not user.location_id:
-        raise HTTPException(status_code=404, detail="Localisation non trouvée")
-
-    location = db.query(Location).filter(Location.id == user.location_id).first()
-    if not location:
-        raise HTTPException(status_code=404, detail="Localisation introuvable")
-
-    try:
-        for key, value in location_data.dict().items():
-            setattr(location, key, value)
-        db.commit()
-        db.refresh(location)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error during location update: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour de la localisation: {str(e)}")
-
-    return location
-
-@router.post("/me/moyenne", response_model=MoyenneResponse)
-def update_moyenne(
-    moyenne_data: MoyenneCreate,
-    db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
-):
-    """Create or update user's grades."""
-    Authorize.jwt_required()
-    email = Authorize.get_jwt_subject()
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
-
-    try:
-        if user.moyenne_id:
-            moyenne = db.query(Moyenne).filter(Moyenne.id == user.moyenne_id).first()
-            if not moyenne:
-                raise HTTPException(status_code=404, detail="Moyenne introuvable")
-            moyenne.specialty = moyenne_data.specialty
-            moyenne.notes = moyenne_data.notes
-        else:
-            moyenne = Moyenne(
-                specialty=moyenne_data.specialty,
-                notes=moyenne_data.notes,
-                user_id=user.id
-            )
-            db.add(moyenne)
-            db.flush()
-            user.moyenne_id = moyenne.id
-
-        db.commit()
-        db.refresh(moyenne)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error during moyenne update: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour des moyennes: {str(e)}")
-
-    return moyenne
-
-@router.get("/me/moyenne", response_model=MoyenneResponse)
-def get_user_moyenne(
-    db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
-):
-    """Get user's grades."""
-    Authorize.jwt_required()
-    email = Authorize.get_jwt_subject()
-    user = db.query(User).filter(User.email == email).first()
-    if not user or not user.moyenne_id:
-        raise HTTPException(status_code=404, detail="Moyenne non trouvée")
-
-    moyenne = db.query(Moyenne).filter(Moyenne.id == user.moyenne_id).first()
-    if not moyenne:
-        raise HTTPException(status_code=404, detail="Moyenne introuvable")
-
-    return moyenne
-
-@router.patch("/me/moyenne", response_model=MoyenneResponse)
-def update_user_moyenne(
-    moyenne_data: MoyenneCreate,
-    db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
-):
-    """Update existing user's grades."""
-    Authorize.jwt_required()
-    email = Authorize.get_jwt_subject()
-    user = db.query(User).filter(User.email == email).first()
-    if not user or not user.moyenne_id:
-        raise HTTPException(status_code=404, detail="Moyenne non trouvée")
-
-    moyenne = db.query(Moyenne).filter(Moyenne.id == user.moyenne_id).first()
-    if not moyenne:
-        raise HTTPException(status_code=404, detail="Moyenne introuvable")
-
-    try:
-        moyenne.specialty = moyenne_data.specialty
-        moyenne.notes = moyenne_data.notes
-        db.commit()
-        db.refresh(moyenne)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error during moyenne update: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la mise à jour des moyennes: {str(e)}")
-
-    return moyenne
-@router.post("/plan-action", response_model=PlanActionResponse)
-def create_plan_action(
-    plan_data: PlanActionCreate,
-    db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
-):
-    """Create a new plan action."""
-    Authorize.jwt_required()
-    email = Authorize.get_jwt_subject()
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
-
-    try:
-        plan = PlanAction(nom=plan_data.nom)
-        db.add(plan)
-        db.commit()
-        db.refresh(plan)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error during plan action creation: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la création du plan d'action: {str(e)}")
-
+    plan = PlanAction(
+        nom=payload.nom,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        is_active=payload.is_active if payload.is_active is not None else True,
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
     return plan
 
-@router.post("/plan-action/{plan_id}/step", response_model=PlanStepResponse)
+@router.get("/plans/{plan_id}", response_model=PlanActionResponse)
+def get_plan(
+    plan_id: int,
+    db: Session = Depends(get_db),
+    Authorize: AuthJWT = Depends(),
+):
+    Authorize.jwt_required()
+    plan = (
+        db.query(PlanAction)
+        .options(selectinload(PlanAction.steps))
+        .filter(PlanAction.id == plan_id)
+        .first()
+    )
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan d’action non trouvé")
+    return plan
+
+@router.post("/plans/{plan_id}/steps", response_model=PlanStepResponse, status_code=201)
 def create_plan_step(
     plan_id: int,
-    step_data: PlanStepCreate,
+    payload: PlanStepCreate,
     db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
+    Authorize: AuthJWT = Depends(),
 ):
-    """Create a new step for a plan action."""
     Authorize.jwt_required()
     plan = db.query(PlanAction).filter(PlanAction.id == plan_id).first()
     if not plan:
-        raise HTTPException(status_code=404, detail="Plan d'action non trouvé")
+        raise HTTPException(status_code=404, detail="Plan d’action non trouvé")
 
-    try:
-        step = PlanStep(titre=step_data.titre, plan_action_id=plan_id)
-        db.add(step)
-        db.commit()
-        db.refresh(step)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error during plan step creation: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la création de l'étape: {str(e)}")
-
+    step = PlanStep(
+        plan_action_id=plan_id,
+        titre=payload.titre,
+        description=payload.description,
+        ordre=payload.ordre,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+    )
+    db.add(step)
+    db.commit()
+    db.refresh(step)
     return step
 
-@router.post("/plan-step/{step_id}/question", response_model=PlanQuestionResponse)
-def create_plan_question(
-    step_id: int,
-    question_data: PlanQuestionCreate,
-    db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
-):
-    """Create a new question for a plan step."""
-    Authorize.jwt_required()
-    step = db.query(PlanStep).filter(PlanStep.id == step_id).first()
-    if not step:
-        raise HTTPException(status_code=404, detail="Étape non trouvée")
-
-    try:
-        question = PlanQuestion(contenu=question_data.contenu, step_id=step_id)
-        db.add(question)
-        db.commit()
-        db.refresh(question)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error during plan question creation: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la création de la question: {str(e)}")
-
-    return question
-
-@router.post("/me/plan-action/assign/{plan_id}", response_model=UserResponse)
-def assign_plan_action(
+@router.post("/users/{user_id}/assign-plan/{plan_id}", response_model=UserResponse)
+def assign_plan_to_user(
+    user_id: int,
     plan_id: int,
     db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
+    Authorize: AuthJWT = Depends(),
 ):
-    """Assign a plan action to the current user."""
     Authorize.jwt_required()
-    email = Authorize.get_jwt_subject()
-    user = db.query(User).filter(User.email == email).first()
+    user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
-
     plan = db.query(PlanAction).filter(PlanAction.id == plan_id).first()
     if not plan:
-        raise HTTPException(status_code=404, detail="Plan d'action non trouvé")
+        raise HTTPException(status_code=404, detail="Plan d’action non trouvé")
 
-    try:
-        user.plan_action_id = plan_id
-        db.commit()
-        db.refresh(user)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error during plan action assignment: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de l'assignation du plan d'action: {str(e)}")
-
+    user.plan_action_id = plan.id
+    db.commit()
+    db.refresh(user)
     return user
-
-@router.post("/me/plan-response", response_model=UserResponse)
-def submit_plan_response(
-    response_data: UserPlanUpdateRequest,
-    db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
-):
-    """Submit or update user responses to plan questions."""
-    Authorize.jwt_required()
-    email = Authorize.get_jwt_subject()
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
-
-    try:
-        for response in response_data.reponses:
-            question = db.query(PlanQuestion).filter(PlanQuestion.id == response.question_id).first()
-            if not question:
-                raise HTTPException(status_code=404, detail=f"Question {response.question_id} non trouvée")
-
-            existing_response = db.query(UserPlanResponse).filter(
-                UserPlanResponse.user_id == user.id,
-                UserPlanResponse.question_id == response.question_id
-            ).first()
-
-            if existing_response:
-                existing_response.reponse = response.reponse
-            else:
-                new_response = UserPlanResponse(
-                    user_id=user.id,
-                    question_id=response.question_id,
-                    reponse=response.reponse
-                )
-                db.add(new_response)
-
-        db.commit()
-        db.refresh(user)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error during plan response submission: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la soumission des réponses: {str(e)}")
-
-    return user
-
-@router.post("/me/step-answer", response_model=UserStepAnswerResponse)
-def submit_step_answer(
-    answer_data: UserStepAnswerCreate,
-    db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
-):
-    """Submit or update user answer to a plan step."""
-    Authorize.jwt_required()
-    email = Authorize.get_jwt_subject()
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
-
-    step = db.query(PlanStep).filter(PlanStep.id == answer_data.step_id).first()
-    if not step:
-        raise HTTPException(status_code=404, detail="Étape non trouvée")
-
-    try:
-        existing_answer = db.query(UserStepAnswer).filter(
-            UserStepAnswer.user_id == user.id,
-            UserStepAnswer.step_id == answer_data.step_id
-        ).first()
-
-        if existing_answer:
-            existing_answer.response = answer_data.response
-        else:
-            new_answer = UserStepAnswer(
-                user_id=user.id,
-                step_id=answer_data.step_id,
-                response=answer_data.response
-            )
-            db.add(new_answer)
-
-        db.commit()
-        db.refresh(existing_answer if existing_answer else new_answer)
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error during step answer submission: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la soumission de la réponse: {str(e)}")
-
-    return existing_answer if existing_answer else new_answer
 
 @router.get("/me/plan-action", response_model=PlanActionResponse)
 def get_user_plan_action(
     db: Session = Depends(get_db),
-    Authorize: AuthJWT = Depends()
+    Authorize: AuthJWT = Depends(),
 ):
-    """Get user's assigned plan action with steps, questions, and responses."""
+    """Return my assigned plan with ordered steps."""
     Authorize.jwt_required()
     email = Authorize.get_jwt_subject()
     user = db.query(User).filter(User.email == email).first()
     if not user:
         raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
-
     if not user.plan_action_id:
         raise HTTPException(status_code=404, detail="Plan d’action non assigné")
 
-    plan = db.query(PlanAction).filter(PlanAction.id == user.plan_action_id).first()
+    plan = (
+        db.query(PlanAction)
+        .options(selectinload(PlanAction.steps))
+        .filter(PlanAction.id == user.plan_action_id)
+        .first()
+    )
     if not plan:
         raise HTTPException(status_code=404, detail="Plan d’action non trouvé")
-
     return plan
 
+# =========================
+# User Step Progress
+# =========================
+
+@router.post("/users/{user_id}/steps/{step_id}/done", response_model=UserStepProgressResponse, status_code=201)
+def mark_step_done(
+    user_id: int,
+    step_id: int,
+    payload: UserStepProgressCreate,
+    db: Session = Depends(get_db),
+    Authorize: AuthJWT = Depends(),
+):
+    Authorize.jwt_required()
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    step = db.query(PlanStep).filter(PlanStep.id == step_id).first()
+    if not step:
+        raise HTTPException(status_code=404, detail="Étape non trouvée")
+
+    progress = (
+        db.query(UserStepProgress)
+        .filter(UserStepProgress.user_id == user_id, UserStepProgress.step_id == step_id)
+        .first()
+    )
+    now = datetime.utcnow()
+    if progress:
+        progress.is_done = True
+        progress.done_at = now
+    else:
+        progress = UserStepProgress(user_id=user_id, step_id=step_id, is_done=True, done_at=now)
+        db.add(progress)
+    db.commit()
+    db.refresh(progress)
+    return progress
+
+@router.patch("/users/{user_id}/steps/{step_id}", response_model=UserStepProgressResponse)
+def update_step_progress(
+    user_id: int,
+    step_id: int,
+    payload: UserStepProgressUpdate,
+    db: Session = Depends(get_db),
+    Authorize: AuthJWT = Depends(),
+):
+    Authorize.jwt_required()
+    progress = (
+        db.query(UserStepProgress)
+        .filter(UserStepProgress.user_id == user_id, UserStepProgress.step_id == step_id)
+        .first()
+    )
+    if not progress:
+        raise HTTPException(status_code=404, detail="Progression introuvable")
+
+    progress.is_done = payload.is_done
+    progress.done_at = datetime.utcnow() if payload.is_done else None
+    db.commit()
+    db.refresh(progress)
+    return progress
+
+@router.get("/users/{user_id}/progress", response_model=List[UserStepProgressResponse])
+def list_user_progress(
+    user_id: int,
+    db: Session = Depends(get_db),
+    Authorize: AuthJWT = Depends(),
+):
+    Authorize.jwt_required()
+    progress = (
+        db.query(UserStepProgress)
+        .filter(UserStepProgress.user_id == user_id)
+        .all()
+    )
+    return progress
+
+
 # Get a specific formation with all details
+
+
+
+@router.get("/formations/{formation_id}", response_model=FormationSchema)
+def get_formation(formation_id: int, db: Session = Depends(get_db)):
+    # Use lazyload('*') to defer all relationship loading
+    formation = db.query(Formation).options(
+        lazyload('*')  # Defer loading of all relationships
+    ).filter(Formation.id == formation_id).first()
+
+    if not formation:
+        raise HTTPException(status_code=404, detail="Formation not found")
+
+    # Force loading of relationships to ensure all data is available for serialization
+    formation.lieu  # Accessing triggers lazy load
+    formation.salaire_bornes
+    formation.badges  # Accessing collections triggers lazy load
+    formation.filieres_bac
+    formation.specialites_favorisees
+    formation.matieres_enseignees
+    formation.debouches_metiers
+    formation.debouches_secteurs
+    formation.ts_taux_par_bac
+    formation.intervalles_admis
+    formation.profils_admis
+    formation.criteres_candidature  # Includes sous_criteres due to relationship
+    formation.boursiers
+    formation.promo_characteristics
+    formation.post_formation_outcomes
+    formation.voie_generale
+    formation.voie_pro
+    formation.voie_technologique
+
+    return formation
+
+
+
+
+# Get a specific formation with all details
+
+@router.get("/formations/voie_technologique", response_model=List[FormationSchema])
+def get_formations_voie_technologique(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    formations = db.query(Formation).filter(Formation.voie_technologique != None).offset(skip).limit(limit).all()
+
+    if not formations:
+        raise HTTPException(status_code=404, detail="Aucune formation voie technologique trouvée.")
+
+    return formations
+
+
 @router.get("/formations/{formation_id}", response_model=FormationSchema)
 def get_formation(formation_id: int, db: Session = Depends(get_db)):
     # Use lazyload('*') to defer all relationship loading
@@ -825,9 +770,223 @@ def get_formation(formation_id: int, db: Session = Depends(get_db)):
 # Get 10 formations
 @router.get("/formations/", response_model=List[FormationSchema])
 def get_formations(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    limit = min(limit, 10)
+
+    try:
+        formations = db.query(Formation).options(
+            lazyload('*'),  # Pour éviter les accès indésirables
+            selectinload(Formation.lieu),
+            selectinload(Formation.salaire_bornes),
+            selectinload(Formation.badges),
+            selectinload(Formation.filieres_bac),
+            selectinload(Formation.specialites_favorisees),
+            selectinload(Formation.matieres_enseignees),
+            selectinload(Formation.debouches_metiers),
+            selectinload(Formation.debouches_secteurs),
+            selectinload(Formation.ts_taux_par_bac),
+            selectinload(Formation.intervalles_admis),
+            selectinload(Formation.criteres_candidature).selectinload(CriteresCandidature.sous_criteres),
+            selectinload(Formation.boursiers),
+            selectinload(Formation.profils_admis),
+            selectinload(Formation.promo_characteristics),
+            selectinload(Formation.post_formation_outcomes),
+            selectinload(Formation.voie_generale),
+            selectinload(Formation.voie_pro),
+            selectinload(Formation.voie_technologique)
+        ).offset(skip).limit(limit).all()
+
+        return formations
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Erreur lors du chargement des formations: {str(e)}")
+# Updated route to get etablissements
+@router.get("/etablissements/", response_model=List[EtablissementSchema])
+def get_etablissements(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
     limit = min(limit, 10)  # Cap limit to prevent overload
-    formations = db.query(Formation).options(
-        joinedload(Formation.lieu),  # Load only critical data eagerly
-        lazyload('*')  # Defer loading of other relationships
-    ).offset(skip).limit(limit).all()
-    return formations
+
+    # Fetch establishments from Formation.lieu and Location
+    etab_from_formation = db.query(Formation.etablissement).distinct().filter(
+        Formation.etablissement.isnot(None)
+    ).subquery()
+
+    etab_from_location = db.query(Formation.etablissement).distinct().filter(
+        Formation.etablissement.isnot(None)
+    ).subquery()
+
+    all_etablissements = db.query(
+        func.coalesce(etab_from_formation.c.etablissement, etab_from_location.c.etablissement)).distinct().all()
+
+    # Paginate the results
+    start = skip
+    end = min(skip + limit, len(all_etablissements))
+    paginated_etablissements = all_etablissements[start:end]
+
+    # Create EtablissementSchema objects with a default description
+    result = [
+        EtablissementSchema(name=etab[0], description=f"Établissement à {etab[0]}")
+        for etab in paginated_etablissements
+    ]
+    return result
+
+
+# Updated route to get academies on lieu
+@router.get("/lieu/academies/", response_model=List[AcademieSchema])
+def get_academies(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    limit = min(limit, 10)  # Cap limit to prevent overload
+
+    # Fetch academies from Formation.lieu and Location
+    acad_from_formation = db.query(Formation.lieu.of_type(LieuSchema).academy).distinct().filter(
+        Formation.lieu.has(LieuSchema.academy.isnot(None))
+    ).subquery()
+
+    acad_from_location = db.query(Lieu.academie).distinct().filter(
+        Lieu.academie.isnot(None)
+    ).subquery()
+
+    all_academies = db.query(
+        func.coalesce(acad_from_formation.c.academy, acad_from_location.c.academie)).distinct().all()
+
+    # Paginate the results
+    start = skip
+    end = min(skip + limit, len(all_academies))
+    paginated_academies = all_academies[start:end]
+
+    # Create AcademieSchema objects
+    result = [
+        AcademieSchema(name=acad[0])
+        for acad in paginated_academies
+    ]
+    return result
+
+@router.get("/academies", response_model=List[AcademieOut])
+def list_academies(
+    q: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    query = db.query(Academie)
+    if q:
+        query = query.filter(Academie.name.ilike(f"%{q}%"))
+    rows = query.order_by(asc(Academie.name)).all()
+    return [AcademieOut(id=a.id, name=a.name) for a in rows]
+
+@router.get("/academies/{academie_id}", response_model=AcademieOut)
+def get_academie(
+    academie_id: int,
+    with_etablissements: bool = True,
+    db: Session = Depends(get_db),
+):
+    query = db.query(Academie)
+    if with_etablissements:
+        query = query.options(selectinload(Academie.etablissements))
+    a = query.filter(Academie.id == academie_id).first()
+    if not a:
+        raise HTTPException(status_code=404, detail="Académie non trouvée")
+
+    return AcademieOut(
+        id=a.id,
+        name=a.name,
+        etablissements=[
+            EtablissementOut(
+                id=e.id,
+                academie_id=e.academie_id,
+                etablissement=e.etablissement,
+                city=e.city,
+                sector=e.sector,
+                track=e.track,
+            ) for e in (a.etablissements or [])
+        ] if with_etablissements else None
+    )
+
+@router.get("/academies/{academie_id}/etablissements", response_model=List[EtablissementOut])
+def list_etablissements_in_academie(
+    academie_id: int,
+    q: Optional[str] = None,
+    city: Optional[str] = None,
+    track: Optional[str] = None,
+    sector: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    exists = db.query(Academie.id).filter(Academie.id == academie_id).first()
+    if not exists:
+        raise HTTPException(status_code=404, detail="Académie non trouvée")
+
+    base = db.query(Etablissement).filter(Etablissement.academie_id == academie_id)
+    if q:
+        base = base.filter(Etablissement.etablissement.ilike(f"%{q}%"))
+    if city:
+        base = base.filter(Etablissement.city.ilike(f"%{city}%"))
+    if track:
+        base = base.filter(Etablissement.track.ilike(f"%{track}%"))
+    if sector:
+        base = base.filter(Etablissement.sector.ilike(f"%{sector}%"))
+
+    rows = base.order_by(asc(Etablissement.etablissement), asc(Etablissement.city)).all()
+    return [
+        EtablissementOut(
+            id=e.id,
+            academie_id=e.academie_id,
+            etablissement=e.etablissement,
+            city=e.city,
+            sector=e.sector,
+            track=e.track,
+        ) for e in rows
+    ]
+
+@router.get("/etablissements", response_model=List[EtablissementOut])
+def list_etablissements(
+    q: Optional[str] = None,
+    academie_id: Optional[int] = None,
+    city: Optional[str] = None,
+    track: Optional[str] = None,
+    sector: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    base = db.query(Etablissement)
+
+    if academie_id is not None:
+        base = base.filter(Etablissement.academie_id == academie_id)
+    if q:
+        base = base.filter(Etablissement.etablissement.ilike(f"%{q}%"))
+    if city:
+        base = base.filter(Etablissement.city.ilike(f"%{city}%"))
+    if track:
+        base = base.filter(Etablissement.track.ilike(f"%{track}%"))
+    if sector:
+        base = base.filter(Etablissement.sector.ilike(f"%{sector}%"))
+
+    rows = base.order_by(asc(Etablissement.etablissement), asc(Etablissement.city)).all()
+    return [
+        EtablissementOut(
+            id=e.id,
+            academie_id=e.academie_id,
+            etablissement=e.etablissement,
+            city=e.city,
+            sector=e.sector,
+            track=e.track,
+        ) for e in rows
+    ]
+
+@router.get("/etablissements/{etablissement_id}", response_model=EtablissementOut)
+def get_etablissement(
+    etablissement_id: int,
+    db: Session = Depends(get_db),
+):
+    e = (
+        db.query(Etablissement)
+        .options(selectinload(Etablissement.academie))
+        .filter(Etablissement.id == etablissement_id)
+        .first()
+    )
+    if not e:
+        raise HTTPException(status_code=404, detail="Établissement non trouvé")
+
+    return EtablissementOut(
+        id=e.id,
+        academie_id=e.academie_id,
+        etablissement=e.etablissement,
+        city=e.city,
+        sector=e.sector,
+        track=e.track,
+    )

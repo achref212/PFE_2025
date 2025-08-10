@@ -1,7 +1,22 @@
 # app/api/auth/schemas.py
+import json
+from pydantic import BaseModel, validator
+
 from pydantic import BaseModel
 from typing import List, Optional
+# Pydantic schemas
+class EtablissementSchema(BaseModel):
+    name: str
+    description: str
 
+    class Config:
+        orm_mode = True
+
+class AcademieSchema(BaseModel):
+    name: str
+
+    class Config:
+        orm_mode = True
 class LieuSchema(BaseModel):
     ville: str
     region: str
@@ -118,8 +133,40 @@ class PostFormationOutcomesSchema(BaseModel):
         orm_mode = True
 
 class VoieSchema(BaseModel):
-    filieres: str
-    specialities: str
+    filieres: List[str] = []
+    specialities: List[str] = []
+
+    @validator("filieres", pre=True)
+    def parse_filieres(cls, v):
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except:
+                return []
+        elif isinstance(v, list):
+            return v
+        return []
+
+    @validator("specialities", pre=True)
+    def parse_specialities(cls, v):
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                # Si c’est un dict (comme {"ST2S": [...]}) → on prend les valeurs
+                if isinstance(parsed, dict):
+                    values = []
+                    for arr in parsed.values():
+                        if isinstance(arr, list):
+                            values.extend(arr)
+                    return values
+                elif isinstance(parsed, list):
+                    return parsed
+                return []
+            except:
+                return []
+        elif isinstance(v, list):
+            return v
+        return []
 
     class Config:
         orm_mode = True
@@ -134,7 +181,13 @@ class FormationSchema(BaseModel):
     type_etablissement: str
     formation_controlee_par_etat: bool
     apprentissage: str
-    prix_annuel: float
+    prix_annuel: Optional[float] = None
+
+    @property
+    def prix_formate(self) -> Optional[str]:
+        if self.prix_annuel is not None:
+            return f"{self.prix_annuel:.2f} €"
+        return None
     salaire_moyen: float
     poursuite_etudes: str
     taux_insertion: str
@@ -168,6 +221,59 @@ class FormationSchema(BaseModel):
     voie_generale: Optional[VoieSchema] = None
     voie_pro: Optional[VoieSchema] = None
     voie_technologique: Optional[VoieSchema] = None
+    class Config:
+        orm_mode = True
+
+class EtablissementBase(BaseModel):
+    etablissement: Optional[str] = None   # school name
+    city: Optional[str] = None
+    sector: Optional[str] = None          # "Privé" / "Public"
+    track: Optional[str] = None           # "Général" / "Technologique" / ...
+
+    class Config:
+        orm_mode = True
+
+class EtablissementCreate(EtablissementBase):
+    academie_id: int
+
+class EtablissementUpdate(BaseModel):
+    etablissement: Optional[str] = None
+    city: Optional[str] = None
+    sector: Optional[str] = None
+    track: Optional[str] = None
+    academie_id: Optional[int] = None
+
+    class Config:
+        orm_mode = True
+
+class EtablissementOut(EtablissementBase):
+    id: int
+    academie_id: int
+
+    class Config:
+        orm_mode = True
+
+
+# ----- Academie -----
+
+class AcademieBase(BaseModel):
+    name: str
+
+    class Config:
+        orm_mode = True
+
+class AcademieCreate(AcademieBase):
+    pass
+
+class AcademieUpdate(BaseModel):
+    name: Optional[str] = None
+
+    class Config:
+        orm_mode = True
+
+class AcademieOut(AcademieBase):
+    id: int
+    etablissements: Optional[List[EtablissementOut]] = None
 
     class Config:
         orm_mode = True
